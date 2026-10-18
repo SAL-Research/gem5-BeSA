@@ -1003,6 +1003,13 @@ X86Process::argsInit(int pageSize,
     initVirtMem->writeString(file_name_base, filename.c_str());
 
     // Fix up the aux vectors which point to data
+    // Write random bytes for AT_RANDOM (used by glibc for stack canary init)
+    {
+        uint8_t random_bytes[numRandomBytes];
+        for (int i = 0; i < numRandomBytes; i++)
+            random_bytes[i] = random() % 256;
+        initVirtMem->writeBlob(aux_data_base, random_bytes, numRandomBytes);
+    }
     assert(auxv[auxv.size() - 3].type == gem5::auxv::Random);
     auxv[auxv.size() - 3].val = aux_data_base;
     assert(auxv[auxv.size() - 2].type == gem5::auxv::Execfn);

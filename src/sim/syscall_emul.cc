@@ -39,11 +39,12 @@
  */
 
 #include "sim/syscall_emul.hh"
-
+#include <sys/epoll.h>
+#include <sys/timerfd.h>
 #include <fcntl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-
+#include <algorithm>
 #include <csignal>
 #include <iostream>
 #include <mutex>
@@ -785,6 +786,166 @@ pipe2Func(SyscallDesc *desc, ThreadContext *tc, VPtr<> tgt_addr, int flags)
 }
 
 SyscallReturn
+epoll_create1Func(SyscallDesc *desc, ThreadContext *tc, int flags)
+{
+    auto p = tc->getProcessPtr();
+
+    int host_fd = epoll_create1(flags);
+    if(host_fd == -1)
+       return -errno;
+
+    auto epfd_entry = std::make_shared<FileFDEntry>(host_fd, 0, "epoll", 0);
+    int tgt_fd = p->fds->allocFD(epfd_entry);
+
+    return tgt_fd;
+}
+
+SyscallReturn
+epoll_ctlFunc(SyscallDesc *desc, ThreadContext *tc,
+              int tgt_epfd, int op, int tgt_fd, VPtr<> event_addr)
+{
+    auto p = tc->getProcessPtr();
+
+    auto epfd_hbentry = (*p->fds)[tgt_epfd];
+    if (!epfd_hbentry)
+        return -EBADF;
+    int host_epfd = std::dynamic_pointer_cast<HBFDEntry>(epfd_hbentry)
+                        ->getSimFD();
+    int host_fd = -1;
+    auto fd_hbentry = (*p->fds)[tgt_fd];
+    if (fd_hbentry) {
+        host_fd = std::dynamic_pointer_cast<HBFDEntry>(fd_hbentry)
+                      ->getSimFD();
+    } else {
+        return -EBADF;
+    }
+
+    struct epoll_event host_event;
+    std::memset(&host_event, 0, sizeof(host_event));
+
+    if (event_addr != 0) {
+        BufferArg event_buf(event_addr, sizeof(struct epoll_event));
+        event_buf.copyIn(SETranslatingPortProxy(tc));
+        std::memcpy(&host_event, event_buf.bufferPtr(),
+                    sizeof(struct epoll_event));
+    }
+
+    int ret = epoll_ctl(host_epfd, op, host_fd, &host_event);
+    if (ret == -1)
+        return -errno;
+
+    return ret;
+}
+
+SyscallReturn
+epoll_waitFunc(SyscallDesc *desc, ThreadContext *tc,
+               int tgt_epfd, VPtr<> events_addr, int maxevents, int timeout)
+{
+    auto p = tc->getProcessPtr();
+
+    auto epfd_hbentry = (*p->fds)[tgt_epfd];
+    if (!epfd_hbentry)
+        return -EBADF;
+    int host_epfd = std::dynamic_pointer_cast<HBFDEntry>(epfd_hbentry)
+                        ->getSimFD();
+
+    if (maxevents <= 0)
+        return -EINVAL;
+
+    std::vector<struct epoll_event> host_events(maxevents);
+    // Force non-blocking: never let the host block gem5's own process.
+    // Real MPI progress-loop semantics won't be timing-accurate here, but
+    // this keeps SE-mode simulation from hanging indefinitely.
+    int actual_timeout = (timeout < 0) ? 0 : timeout;
+
+    int nfds = epoll_wait(host_epfd, host_events.data(), maxevents,
+                          actual_timeout);
+    if (nfds == -1)
+        return -errno;
+
+    if (nfds > 0) {
+        BufferArg events_buf(events_addr,
+                             sizeof(struct epoll_event) * nfds);
+        std::memcpy(events_buf.bufferPtr(), host_events.data(),
+                    sizeof(struct epoll_event) * nfds);
+        events_buf.copyOut(SETranslatingPortProxy(tc));
+    }
+
+    return nfds;
+}
+
+SyscallReturn
+timerfd_createFunc(SyscallDesc *desc, ThreadContext *tc,
+                    int clockid, int flags)
+{
+    auto p = tc->getProcessPtr();
+
+    int host_fd = timerfd_create(clockid, flags);
+    if (host_fd == -1)
+        return -errno;
+    auto tfd_entry = std::make_shared<FileFDEntry>(host_fd, 0, "timerfd", 0);
+    int tgt_fd = p->fds->allocFD(tfd_entry);
+    return tgt_fd;
+}
+
+SyscallReturn
+timerfd_settimeFunc(SyscallDesc *desc, ThreadContext *tc,
+                     int tgt_fd, int flags,
+                     VPtr<> new_value_addr, VPtr<> old_value_addr)
+{
+    auto p = tc->getProcessPtr();
+    auto fd_hbentry = (*p->fds)[tgt_fd];
+    if (!fd_hbentry)
+        return -EBADF;
+    int host_fd = std::dynamic_pointer_cast<HBFDEntry>(fd_hbentry)
+                      ->getSimFD();
+
+    struct itimerspec new_value;
+    std::memset(&new_value, 0, sizeof(new_value));
+    BufferArg new_value_buf(new_value_addr, sizeof(struct itimerspec));
+    new_value_buf.copyIn(SETranslatingPortProxy(tc));
+    std::memcpy(&new_value, new_value_buf.bufferPtr(), sizeof(struct itimerspec));
+
+    struct itimerspec old_value;
+    std::memset(&old_value, 0, sizeof(old_value));
+
+    int ret = timerfd_settime(host_fd, flags, &new_value,
+                               old_value_addr != 0 ? &old_value : nullptr);
+    if (ret == -1)
+        return -errno;
+
+    if (old_value_addr != 0) {
+        BufferArg old_value_buf(old_value_addr, sizeof(struct itimerspec));
+        std::memcpy(old_value_buf.bufferPtr(), &old_value, sizeof(struct itimerspec));
+        old_value_buf.copyOut(SETranslatingPortProxy(tc));
+    }
+    return ret;
+}
+
+SyscallReturn
+timerfd_gettimeFunc(SyscallDesc *desc, ThreadContext *tc,
+                     int tgt_fd, VPtr<> curr_value_addr)
+{
+    auto p = tc->getProcessPtr();
+    auto fd_hbentry = (*p->fds)[tgt_fd];
+    if (!fd_hbentry)
+        return -EBADF;
+    int host_fd = std::dynamic_pointer_cast<HBFDEntry>(fd_hbentry)
+                      ->getSimFD();
+
+    struct itimerspec curr_value;
+    std::memset(&curr_value, 0, sizeof(curr_value));
+    int ret = timerfd_gettime(host_fd, &curr_value);
+    if (ret == -1)
+        return -errno;
+
+    BufferArg curr_value_buf(curr_value_addr, sizeof(struct itimerspec));
+    std::memcpy(curr_value_buf.bufferPtr(), &curr_value, sizeof(struct itimerspec));
+    curr_value_buf.copyOut(SETranslatingPortProxy(tc));
+    return ret;
+}
+
+SyscallReturn
 getpgrpFunc(SyscallDesc *desc, ThreadContext *tc)
 {
     auto process = tc->getProcessPtr();
@@ -1333,7 +1494,6 @@ getsockoptFunc(SyscallDesc *desc, ThreadContext *tc,
                int tgt_fd, int level, int optname, VPtr<> valPtr,
                VPtr<> lenPtr)
 {
-    // union of all possible return value types from getsockopt
     union val
     {
         int i_val;
@@ -1341,30 +1501,36 @@ getsockoptFunc(SyscallDesc *desc, ThreadContext *tc,
         struct linger linger_val;
         struct timeval timeval_val;
     } val;
-
     auto p = tc->getProcessPtr();
-
     auto sfdp = std::dynamic_pointer_cast<SocketFDEntry>((*p->fds)[tgt_fd]);
     if (!sfdp)
         return -EBADF;
     int sim_fd = sfdp->getSimFD();
 
+    SETranslatingPortProxy proxy(tc);
+
+    // Read the guest's actual requested buffer size BEFORE calling the
+    // host, so we never write back more bytes than the guest allocated.
+    BufferArg guestLenBuf(lenPtr, sizeof(socklen_t));
+    guestLenBuf.copyIn(proxy);
+    socklen_t guest_len;
+    memcpy(&guest_len, guestLenBuf.bufferPtr(), sizeof(socklen_t));
+
     socklen_t len = sizeof(val);
     int status = getsockopt(sim_fd, level, optname, &val, &len);
-
     if (status == -1)
         return -errno;
 
-    SETranslatingPortProxy proxy(tc);
+    // Cap the writeback at whichever is smaller: what the host actually
+    // returned, or what the guest's buffer can actually hold.
+    socklen_t copy_len = std::min(len, guest_len);
 
-    // copy val to valPtr and pass it on
-    BufferArg valBuf(valPtr, sizeof(val));
-    memcpy(valBuf.bufferPtr(), &val, sizeof(val));
+    BufferArg valBuf(valPtr, copy_len);
+    memcpy(valBuf.bufferPtr(), &val, copy_len);
     valBuf.copyOut(proxy);
 
-    // copy len to lenPtr and pass  it on
-    BufferArg lenBuf(lenPtr, sizeof(len));
-    memcpy(lenBuf.bufferPtr(), &len, sizeof(len));
+    BufferArg lenBuf(lenPtr, sizeof(copy_len));
+    memcpy(lenBuf.bufferPtr(), &copy_len, sizeof(copy_len));
     lenBuf.copyOut(proxy);
 
     return status;
@@ -1389,20 +1555,22 @@ getsocknameFunc(SyscallDesc *desc, ThreadContext *tc,
     // Read in the value of len from the passed pointer.
     BufferArg lenBuf(lenPtr, sizeof(socklen_t));
     lenBuf.copyIn(proxy);
-    socklen_t len = *(socklen_t *)lenBuf.bufferPtr();
+    socklen_t guest_len = *(socklen_t *)lenBuf.bufferPtr();
 
-    struct sockaddr sa;
-    int status = getsockname(sim_fd, &sa, &len);
+    struct sockaddr_storage sa;
+    socklen_t len = sizeof(sa);
+    int status = getsockname(sim_fd, (struct sockaddr *)&sa, &len);
 
     if (status == -1)
         return -errno;
 
-    // Copy address to addrPtr and pass it on.
-    BufferArg addrBuf(addrPtr, sizeof(sa));
-    memcpy(addrBuf.bufferPtr(), &sa, sizeof(sa));
+    // Copy at most guest_len bytes back (like Linux does)
+    socklen_t copy_len = std::min(len, guest_len);
+    BufferArg addrBuf(addrPtr, copy_len);
+    memcpy(addrBuf.bufferPtr(), &sa, copy_len);
     addrBuf.copyOut(proxy);
 
-    // Copy len to lenPtr and pass  it on.
+    // Write back the real address length (can be > guest_len)
     *(socklen_t *)lenBuf.bufferPtr() = len;
     lenBuf.copyOut(proxy);
 

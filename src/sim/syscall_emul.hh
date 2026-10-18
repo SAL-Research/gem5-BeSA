@@ -274,6 +274,25 @@ SyscallReturn pipeFunc(SyscallDesc *desc, ThreadContext *tc, VPtr<> tgt_addr);
 SyscallReturn pipe2Func(SyscallDesc *desc, ThreadContext *tc,
                         VPtr<> tgt_addr, int flags);
 
+/// Target epoll_create1() handler.
+SyscallReturn epoll_create1Func(SyscallDesc *desc, ThreadContext *tc, int flags);
+
+/// Target epoll_ctl() handler.
+SyscallReturn epoll_ctlFunc(SyscallDesc *desc, ThreadContext *tc, int epfd, int op, int fd,
+			    VPtr<> event_addr);
+
+// Target epoll_wait() handler.
+SyscallReturn epoll_waitFunc(SyscallDesc *desc, ThreadContext *tc, int epfd,
+			     VPtr<> events_addr, int maxevents, int timeout);
+
+SyscallReturn timerfd_createFunc(SyscallDesc *desc, ThreadContext *tc,
+                                  int clockid, int flags);
+SyscallReturn timerfd_settimeFunc(SyscallDesc *desc, ThreadContext *tc,
+                                   int tfd, int flags,
+                                   VPtr<> new_value, VPtr<> old_value);
+SyscallReturn timerfd_gettimeFunc(SyscallDesc *desc, ThreadContext *tc,
+                                   int tfd, VPtr<> curr_value);
+
 /// Target getpid() handler.
 SyscallReturn getpidFunc(SyscallDesc *desc, ThreadContext *tc);
 
@@ -1926,6 +1945,10 @@ cloneFunc(SyscallDesc *desc, ThreadContext *tc, RegVal flags, RegVal newStack,
     return doClone<OS>(desc, tc, flags, newStack, ptidPtr, ctidPtr, tlsPtr);
 }
 
+/// Target vfork() handler.
+template <class OS>
+SyscallReturn vforkFunc(SyscallDesc *desc, ThreadContext *tc);
+
 template <class OS>
 SyscallReturn
 cloneBackwardsFunc(SyscallDesc *desc, ThreadContext *tc, RegVal flags,
@@ -1933,6 +1956,18 @@ cloneBackwardsFunc(SyscallDesc *desc, ThreadContext *tc, RegVal flags,
                    VPtr<> ctidPtr)
 {
     return cloneFunc<OS>(desc, tc, flags, newStack, ptidPtr, ctidPtr, tlsPtr);
+}
+
+/// Target vfork() handler. vfork() takes no arguments; on real Linux it is
+/// implemented internally as clone(CLONE_VFORK | CLONE_VM | SIGCHLD, 0), so
+/// we replicate that exact translation here rather than emulating vfork's
+/// semantics separately.
+template <class OS>
+SyscallReturn
+vforkFunc(SyscallDesc *desc, ThreadContext *tc)
+{
+    RegVal flags = OS::TGT_CLONE_VFORK | OS::TGT_CLONE_VM | OS::TGT_SIGCHLD;
+    return cloneFunc<OS>(desc, tc, flags, 0, VPtr<>(0), VPtr<>(0), VPtr<>(0));
 }
 
 /// Target fstatfs() handler.
@@ -3007,7 +3042,7 @@ acceptFunc(SyscallDesc *desc, ThreadContext *tc,
         return -errno;
 
     if (addrPtr) {
-        memcpy(addrBufPtr->bufferPtr(), &sa, sizeof(sa));
+        memcpy(addrBufPtr->bufferPtr(), &sa, addrLen);
         addrBufPtr->copyOut(SETranslatingPortProxy(tc));
         delete(addrBufPtr);
     }
@@ -3125,7 +3160,7 @@ recvfromFunc(SyscallDesc *desc, ThreadContext *tc,
     // Copy address to addr_ptr and pass it on.
     if (sap != NULL) {
         BufferArg addr_buf(addr_ptr, addr_len);
-        memcpy(addr_buf.bufferPtr(), sap, sizeof(sa));
+        memcpy(addr_buf.bufferPtr(), sap, addr_len);
         addr_buf.copyOut(proxy);
     }
 

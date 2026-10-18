@@ -149,16 +149,15 @@ class BaseCPUCore(AbstractCore):
         interrupt_requestor: Optional[Port] = None,
         interrupt_responce: Optional[Port] = None,
     ) -> None:
-        # TODO: This model assumes that we will only create an interrupt
-        # controller as we require it. Not sure how true this is in all cases.
         self.core.createInterruptController()
 
         if self.get_isa().value == ISA.X86.value:
-            if interrupt_requestor != None:
-                self.core.interrupts[0].pio = interrupt_requestor
-                self.core.interrupts[0].int_responder = interrupt_requestor
-            if interrupt_responce != None:
-                self.core.interrupts[0].int_requestor = interrupt_responce
+            for interrupt in self.core.interrupts:
+                if interrupt_requestor != None:
+                    interrupt.pio = interrupt_requestor
+                    interrupt.int_responder = interrupt_requestor
+                if interrupt_responce != None:
+                    interrupt.int_requestor = interrupt_responce
 
     @overrides(AbstractCore)
     def get_mmu(self) -> BaseMMU:
